@@ -1,7 +1,8 @@
 package main
 
 import (
-	"l1zz/ssgo"
+	. "l1zz/ssgo"
+
 	"log"
 	"log/slog"
 	"net"
@@ -33,16 +34,13 @@ func main() {
 var NO_AUTHENTICATION = [2]byte{5, 0}
 
 func process(client net.Conn) {
-	defer client.Close()
 	remote, err := net.Dial("tcp", "localhost:8388")
 	if err != nil {
 		return
 	}
-	defer remote.Close()
-	// wrapper := ssgo.NewConnWrapper(remote)
-	enc, dec := ssgo.Split(remote)
+	enc, dec := Split(remote)
 
-	buff := make([]byte, 4096)
+	buff := make([]byte, FOUR_K)
 
 	// method selection
 	_, err = client.Read(buff)
@@ -64,45 +62,52 @@ func process(client net.Conn) {
 	client.Write(buff[:n])
 
 	// fill first request
-	m, err := client.Read(buff[n : cap(buff)-16])
+	m, err := client.Read(buff[n : len(buff)-16])
 	if err != nil {
 		return
 	}
 
-	_, err = enc.Write(buff[3 : m+n])
+	err = WriteAll(enc, buff[3:m+n])
+
 	if err != nil {
 		return
 	}
+
+	buff = nil
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		for text, err := range dec {
 			if err != nil {
-				log.Println(err)
 				break
 			}
-			err := ssgo.WriteAll(client, text)
+			err := WriteAll(client, text)
 			if err != nil {
-				log.Println(err)
+				slog.Debug("write back", "err", err)
 				break
 			}
 		}
 		wg.Done()
 	}()
+
 	go func() {
+		buff = make([]byte, FOUR_K)
 		for {
-			n, err := client.Read(buff[:4096-16])
+			n, err := client.Read(buff[:len(buff)-TagSize])
 			if err != nil {
-				log.Println(err)
+				slog.Debug("read from client", "err", err)
 				break
 			}
-			err = ssgo.WriteAll(enc, buff[:n])
+			err = WriteAll(enc, buff[:n])
 			if err != nil {
-				log.Println(err)
+				slog.Debug("write to remote", "err", err)
 				break
 			}
 		}
 		wg.Done()
 	}()
+
 	wg.Wait()
+	client.Close()
+	remote.Close()
 }

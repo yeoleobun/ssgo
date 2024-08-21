@@ -14,7 +14,7 @@ import (
 
 var PrimaryKey = EVP_BytesToKey("barfoo!", 32)
 
-const _4k = 4096
+const FOUR_K int = 4096
 
 const SaltSize = 32
 const KeySize = 32
@@ -25,7 +25,7 @@ const MaxPayloadSize = 0x3fff
 type Nonce [NonceSize]byte
 
 func (nonce *Nonce) increase() {
-	c := 1
+	var c = 1
 	for i, b := range nonce {
 		c += int(b)
 		nonce[i] = byte(c)
@@ -33,25 +33,26 @@ func (nonce *Nonce) increase() {
 	}
 }
 
-func rest(bytes []byte) []byte {
+func Rest(bytes []byte) []byte {
 	return bytes[len(bytes):cap(bytes)]
 }
 
-func grow(bytes *[]byte, n int) {
+func Grow(bytes *[]byte, n int) {
 	*bytes = (*bytes)[:len(*bytes)+n]
 }
 
-func consume(bytes *[]byte, n int) {
+func Consume(bytes *[]byte, n int) {
 	*bytes = (*bytes)[n:]
 }
 
-func ensure(conn net.Conn, buff *[]byte, ciphertext *[]byte, n int) error {
+// ciphertext is a slice of buff
+func ensure(conn net.Conn, buff *[]byte, ciphertext *[]byte, n int) (err error) {
 	if len(*ciphertext) >= n {
 		return nil
 	}
 
 	if cap(*buff) < n {
-		newBuff := make([]byte, (n+_4k-1)/_4k*_4k)
+		newBuff := make([]byte, (n+FOUR_K-1)/FOUR_K*FOUR_K)
 		*buff = newBuff
 	}
 
@@ -60,31 +61,23 @@ func ensure(conn net.Conn, buff *[]byte, ciphertext *[]byte, n int) error {
 		*ciphertext = (*buff)[:m]
 	}
 
-	m, err := io.ReadAtLeast(conn, rest(*ciphertext), n-len(*ciphertext))
-	grow(ciphertext, m)
-	if err != nil {
-		return err
-	}
-	return nil
+	var m int
+	m, err = io.ReadAtLeast(conn, Rest(*ciphertext), n-len(*ciphertext))
+	Grow(ciphertext, m)
+	return
 }
 
 func DecryptSeq(conn net.Conn) iter.Seq2[[]byte, error] {
 	return func(yield func([]byte, error) bool) {
-		buff := make([]byte, _4k)
+		buff := make([]byte, FOUR_K)
 		n, err := conn.Read(buff)
-		if err != nil {
-			yield(nil, err)
+		if err != nil && !yield(nil, err) {
 			return
 		}
 		key := HKDF_SHA1(buff[:SaltSize], PrimaryKey, KeySize)
-		aead, err := chacha20poly1305.New(key)
-		if err != nil {
-			yield(nil, err)
-			return
-		}
+		aead, _ := chacha20poly1305.New(key)
 		var nonce Nonce
 		ciphertext := buff[SaltSize:n]
-		i := 0
 		for {
 			err := ensure(conn, &buff, &ciphertext, 2+TagSize)
 			if err != nil && !yield(nil, err) {
@@ -93,22 +86,19 @@ func DecryptSeq(conn net.Conn) iter.Seq2[[]byte, error] {
 
 			_, err = aead.Open(ciphertext[:0], nonce[:], ciphertext[:2+TagSize], nil)
 			if err != nil && !yield(nil, err) {
-				slog.Debug("decrypt length ", "err", err, "index", i)
 				break
 			}
 
 			nonce.increase()
 			length := int(binary.BigEndian.Uint16(ciphertext))
-			consume(&ciphertext, 2+TagSize)
+			Consume(&ciphertext, 2+TagSize)
 
 			ensure(conn, &buff, &ciphertext, length+TagSize)
 			if !yield(aead.Open(ciphertext[:0], nonce[:], ciphertext[:length+TagSize], nil)) {
-				slog.Debug("decrypt payload ", "err", err, "index", i)
 				break
 			}
 			nonce.increase()
-			consume(&ciphertext, length+TagSize)
-			i += 1
+			Consume(&ciphertext, length+TagSize)
 		}
 	}
 }
@@ -121,16 +111,12 @@ type EncryptWriter struct {
 }
 
 func Split(conn net.Conn) (io.Writer, iter.Seq2[[]byte, error]) {
-	return NewConnWrapper(conn), DecryptSeq(conn)
+	return &EncryptWriter{conn: conn}, DecryptSeq(conn)
 }
 
-func NewConnWrapper(conn net.Conn) *EncryptWriter {
-	return &EncryptWriter{conn: conn}
-}
-
-// b should have TagSize remaining capacity
+// b should have at least TagSize remaining capacity
 func (w *EncryptWriter) Write(b []byte) (n int, err error) {
-	var buffers net.Buffers
+	var buffers net.Buffers = make([][]byte, 0, 3)
 	if w.aead == nil {
 		salt := make([]byte, SaltSize)
 		rand.Read(salt)
@@ -147,9 +133,11 @@ func (w *EncryptWriter) Write(b []byte) (n int, err error) {
 	for len(buffers) > 0 {
 		_, err = buffers.WriteTo(w.conn)
 		if err != nil {
+			slog.Debug("write buffers", "err", err)
 			return
 		}
 	}
+	n = len(b)
 	return
 }
 
